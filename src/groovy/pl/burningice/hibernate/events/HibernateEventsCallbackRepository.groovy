@@ -4,29 +4,13 @@ import groovy.transform.EqualsAndHashCode
 import groovy.util.logging.Slf4j
 import org.codehaus.groovy.grails.commons.GrailsApplication
 import org.springframework.aop.support.AopUtils
+import org.springframework.transaction.support.TransactionSynchronization
 import org.springframework.transaction.support.TransactionSynchronizationAdapter
 import org.springframework.transaction.support.TransactionSynchronizationManager
 
 import javax.annotation.PostConstruct
 import java.lang.reflect.Method
 
-/**
- * Holds information about hibernate event callbacks. Registered as a Spring Bean.
- * Hibernate callback is a method annotated with {@link HibernateEventCallback} inside of a Spring Bean annotated with {@link HibernateEventCallbacksContainer}:
- *
- * @HibernateEventCallbacksContainer
- * class MyCallbackContainer {
- *
- * @HibernateEventCallback ( domain = MyDomainObject , eventTypes = [EventType.POST_CREATE] )
- *     public void methodOne(HibernateEvent<Brochure> event) {
- *         ....
- *}*}*
- * Required:
- * - container is a Spring Bean
- * - callback is a method with one parameter of type HibernateEvent
- *
- * @author Pawel Gdula
- */
 @Slf4j
 final class HibernateEventsCallbackRepository {
 
@@ -85,8 +69,13 @@ final class HibernateEventsCallbackRepository {
     private CallbackExecutor getCallback(final Object callback, final Method method, final EventType eventType) {
         CallbackExecutor callbackExecutor = new DefaultCallbackExecutor(callback, method)
 
-        if (!eventType.inTransactionScope) {
-            callbackExecutor = new TransactionSynchronizationManagerCallbackExecutorWrapper(callbackExecutor)
+        switch (eventType.scope) {
+            case ExecutionScope.TRANSACTION_COMMITTED:
+                callbackExecutor = new TSMCallbackExecutorWrapper(callbackExecutor, TransactionSynchronization.STATUS_COMMITTED)
+                break;
+            case ExecutionScope.TRANSACTION_ROLLBACK:
+                callbackExecutor = new TSMCallbackExecutorWrapper(callbackExecutor, TransactionSynchronization.STATUS_ROLLED_BACK)
+                break;
         }
 
         return callbackExecutor
@@ -136,20 +125,25 @@ final class HibernateEventsCallbackRepository {
     /**
      * Wrapper around CallbackExecutor which provide transaction synchronization
      */
-    private static class TransactionSynchronizationManagerCallbackExecutorWrapper implements CallbackExecutor {
+    private static class TSMCallbackExecutorWrapper implements CallbackExecutor {
 
         private final CallbackExecutor callbackExecutor
 
-        TransactionSynchronizationManagerCallbackExecutorWrapper(CallbackExecutor callbackExecutor) {
+        private final int expectedStatus
+
+        TSMCallbackExecutorWrapper(final CallbackExecutor callbackExecutor, final int expectedStatus) {
             this.callbackExecutor = callbackExecutor
+            this.expectedStatus = expectedStatus
         }
 
         @Override
         void execute(final HibernateEvent event) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronizationAdapter() {
                 @Override
-                void afterCommit() {
-                    callbackExecutor.execute(event)
+                void afterCompletion(int status) {
+                    if (expectedStatus == status) {
+                        callbackExecutor.execute(event)
+                    }
                 }
             })
         }
